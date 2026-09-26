@@ -8,15 +8,12 @@ from sandbox.village import action, day, geometry, layout, me, people, props
 
 # Duration (in ticks) to hold "use" on a prop, by its transition type. Timed props use
 # duration/4 so villagers don't stall for the full catalog duration (plot is shortened further,
-# to 100); toggle/occupancy get a short hold. "sleep" is reserved for the end-of-day return
-# home, not idle flavor.
-_TIMED_USE_TICKS = {"plot": 100, "shrine": 75, "bell": 10, "pump": 3}
+# to 50, since only the two farmers ever tend one); toggle/occupancy get a short hold. "sleep" is
+# reserved for the end-of-day return home, not idle flavor.
+_TIMED_USE_TICKS = {"plot": 50, "shrine": 75, "bell": 10, "pump": 3}
 _TOGGLE_TYPES = ("lantern", "hearth", "stall")
 _OCCUPANCY_TYPES = ("bench", "repair_bench")
 _IDLE_EMOTES = tuple(emote for emote in action.EMOTES if emote != "sleep")
-_TASK_TYPES = frozenset(
-    {"plot", "shrine", "pump", "bell", "stall", "lantern", "hearth", "bench", "repair_bench", "board"}
-)
 # Each prop's untouched state. Anything else means another villager already handled it (a tended
 # plot, a lit lantern) or is on it right now (an occupied bench), so there is no work left here.
 _PROP_START_STATE = {
@@ -38,6 +35,42 @@ _VISITOR_APPROACH_RANGE = 8.0  # blocks; only detour to greet if visitor is this
 _VISITOR_GREET_DISTANCE = 2.0  # blocks; walk to this distance before actually greeting
 _BELL_RANGE = 50.0  # blocks; how far a villager will detour to answer a ringing bell
 _RETURN_HOME_TICK = 1000  # of the 1200-tick day; when villagers head home for the "night"
+
+_HOP_REACH_MIN = 5.0  # blocks; short legs toward a destination, sweeping between each
+_HOP_REACH_MAX = 30.0
+_OCCUPIED_CHECK_RANGE = 2.0  # blocks; someone this close to a prop already has it, pick another
+
+_BREAK_MIN_TICKS = 15  # after completing a task, idle-hop for a random duration before next task
+_BREAK_MAX_TICKS = 45
+
+_LIGHT_TYPES = ("lantern", "hearth")
+
+# Which prop types each role deliberately seeks out, once no one else is already on the nearest
+# one. Only farmers touch plots; the building-wanderer role has no props of its own (see
+# _advance_building) so it is intentionally left out of this mapping.
+_ROLE_TARGET_TYPES = {
+    "farmer": ("plot",),
+    "shrine_keeper": ("shrine",),
+    "wellkeeper": ("pump",),
+    "stall_tender": ("stall",),
+    "occupancy_tender": ("bench", "repair_bench"),
+    "lighter": _LIGHT_TYPES,
+}
+
+# 10 seats this season: 2 farmers, 2 shrine keepers, 1 wellkeeper, 2 stall tenders, 1 occupancy
+# tender, 1 lighter, 1 building-wanderer. Indexed by player number (wraps if the cast is smaller).
+_ROLE_ORDER = (
+    "farmer",
+    "farmer",
+    "shrine_keeper",
+    "shrine_keeper",
+    "wellkeeper",
+    "stall_tender",
+    "stall_tender",
+    "occupancy_tender",
+    "lighter",
+    "building_wanderer",
+)
 
 
 def _cell_centre(cell: dict[str, int]) -> dict[str, float]:
@@ -99,42 +132,43 @@ def _bfs_path(observation, start_cell, dest_cell):
 
 
 class Agent:
-    """Leaves home, tends its plot, wanders the village, and reacts to people it sees."""
+    """Leaves home, does its role's rounds, wanders the village, and reacts to people it sees."""
 
     def reset(self, seed: int, observation: ThreeBranchesObservation) -> None:
-        """Initialize per-day state: home, plot, personality, and tracking structures."""
+        """Initialize per-day state: home, role, and tracking structures."""
 
         # Home & doorway (static for the day)
         self.home = me.home(observation)
         self.home_doorway = layout.doorway(observation, self.home) if self.home != "none" else None
 
-        # Claim closest plot to home
-        here = me.position(observation)
-        plots = [prop for prop in props.all(observation) if prop["type"] == "plot"]
-        self.claimed_plot = min(
-            plots,
-            key=lambda p: geometry.distance(here, _cell_centre(p["cell"])),
-        ) if plots else None
+        # Role: fixed by player number, not randomized. Determines which props (if any) this
+        # villager deliberately seeks out all day; see _ROLE_TARGET_TYPES and _advance_building.
+        index = int(me.player_id(observation).split("_")[1]) - 1
+        self.role = _ROLE_ORDER[index % len(_ROLE_ORDER)]
 
-        # Personality: which destination-picking strategy this villager follows all day
-        rng = me.rng(observation, seed)
-        self.personality = rng.choice(["wander_random", "visit_building", "seek_tasks"])
-        self.rng = rng  # kept for destination picks and random emotes during the day
+        self.rng = me.rng(observation, seed)  # kept for hop picks, idle emotes, and building picks
 
         # Day-phase tracking
-        self.phase = "plot"  # "plot" -> "wander" -> "returning"
+        self.phase = "task"  # "task" -> "returning"
+        self.announced_role = False  # broadcast role once at start of day
         self.used_props = set()  # prop ids already used today, never repeated
         self.greeted = {}  # {player_id: last_greeted_tick}, per-person greet cooldown
         self.startled = {}  # {player_id: last_startled_tick}, separate from greeted on purpose
         self.pending_greet = None  # {"id", "ready_tick", "approach_player"?} while greeting
 
-        # Destination & task state
-        self.current_destination = None  # position dict to walk toward
+        # Role-task state: the prop (or, for building_wanderer, doorway) currently claimed as
+        # this villager's next job, and the short waypoint it is hopping toward on the way there
+        self.role_target = None  # {"prop_id", "type", "position"} or None
+        self.hop_point = None
         self.active_task = None  # {"prop_id": str, "ticks_remaining": int} while mid-use
         self.use_counter = 0
+        self.break_ticks_remaining = 0  # idle-hop after completing a task before picking next
 
-        # Pathfinding cache
-        self._path = None  # cached cardinal-step path to current destination
+        # Direct-walk destination, used only for the bell response (no hops -- answer it quickly)
+        self.current_destination = None
+
+        # Pathfinding cache, shared by both the bell response and the hop travel above
+        self._path = None  # cached cardinal-step path to whichever destination is active
         self._path_destination = None  # (x, y) tuple of cached path's target
         self.stuck_ticks = 0  # consecutive near-zero-movement ticks while walking a destination
 
@@ -146,9 +180,9 @@ class Agent:
         if prop_type in _TIMED_USE_TICKS:
             return _TIMED_USE_TICKS[prop_type]
         if prop_type in _TOGGLE_TYPES:
-            return self.rng.randint(5, 8)
+            return 3
         if prop_type in _OCCUPANCY_TYPES:
-            return self.rng.randint(5, 8)
+            return self.rng.randint(4, 6)
         return 1  # e.g. "board": no state to hold, just a passing glance
 
     def _walk_toward(self, destination: dict[str, float], observation: ThreeBranchesObservation) -> float:
@@ -172,40 +206,132 @@ class Agent:
             return geometry.heading_to(here, destination)
         return geometry.heading_to(here, _cell_centre(self._path[0]))
 
-    def _pick_destination(self, observation: ThreeBranchesObservation) -> dict[str, float]:
-        """Pick the next place to head, per this villager's personality. Always returns an
-        actually-walkable point, since a prop or building cell can itself be blocked by
-        collision (a raw prop cell led to villagers oscillating against it)."""
+    def _random_nearby_point(self, observation: ThreeBranchesObservation, here) -> dict[str, float]:
+        """A random walkable point a short hop away, for idling when a role has no work left."""
+        for _ in range(20):
+            angle = math.radians(self.rng.uniform(0.0, 360.0))
+            reach = self.rng.uniform(_HOP_REACH_MIN, _HOP_REACH_MAX)
+            point = {"x": here["x"] + reach * math.cos(angle), "y": here["y"] + reach * math.sin(angle)}
+            cell = layout.cell_at(observation, point)
+            if cell is not None and layout.walkable(observation, cell):
+                return _cell_centre(cell)
+        return here
+
+    def _pick_hop_point(self, observation: ThreeBranchesObservation, here, target_pos) -> dict[str, float]:
+        """A short waypoint along the real path toward target_pos, so travel comes in small hops."""
+        here_cell = layout.cell_at(observation, here)
+        dest_cell = layout.cell_at(observation, target_pos)
+        if here_cell is None or dest_cell is None:
+            return target_pos
+        dest_cell = _nearest_walkable_cell(observation, dest_cell)
+        path = _bfs_path(observation, here_cell, dest_cell) or []
+        if not path:
+            return target_pos
+        hop_len = max(1, int(self.rng.uniform(_HOP_REACH_MIN, _HOP_REACH_MAX)))
+        index = min(hop_len, len(path)) - 1
+        return _cell_centre(path[index])
+
+    def _available_props(self, observation: ThreeBranchesObservation, prop_types):
+        """All untended props of these types that nobody visible is already working on."""
+        watchers = [person["position"] for person in people.seen(observation)]
+        watchers += [person["position"] for person in people.nearby(observation)]
+        candidates = []
+        for prop in props.all(observation):
+            if prop["type"] not in prop_types:
+                continue
+            if prop["id"] in self.used_props:
+                continue
+            if not _prop_untouched(observation, prop):
+                continue
+            prop_pos = _cell_centre(prop["cell"])
+            if any(geometry.distance(prop_pos, watcher) <= _OCCUPIED_CHECK_RANGE for watcher in watchers):
+                continue  # someone is already standing right on this one -- let them have it
+            candidates.append(prop)
+        return candidates
+
+    def _nearest_available_prop(self, observation: ThreeBranchesObservation, prop_types):
+        """Closest untended prop of these types that nobody visible is already working, or None."""
         here = me.position(observation)
+        candidates = self._available_props(observation, prop_types)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda prop: geometry.distance(here, _cell_centre(prop["cell"])))
 
-        if self.personality == "wander_random":
-            for _ in range(20):
-                angle = math.radians(self.rng.uniform(0.0, 360.0))
-                reach = self.rng.uniform(5.0, 30.0)
-                point = {"x": here["x"] + reach * math.cos(angle), "y": here["y"] + reach * math.sin(angle)}
-                cell = layout.cell_at(observation, point)
-                if cell is not None and layout.walkable(observation, cell):
-                    return _cell_centre(cell)
-            return here
+    def _random_available_prop(self, observation: ThreeBranchesObservation, prop_types):
+        """Random untended prop of these types that nobody visible is already working, or None."""
+        candidates = self._available_props(observation, prop_types)
+        if not candidates:
+            return None
+        return self.rng.choice(candidates)
 
-        if self.personality == "visit_building":
+    def _opportunistic_light(self, observation: ThreeBranchesObservation):
+        """An unlit lantern/hearth right here to toggle on the way, regardless of role."""
+        usable = props.usable(observation)
+        if usable is None or usable["type"] not in _LIGHT_TYPES:
+            return None
+        if usable["id"] in self.used_props:
+            return None
+        if not _prop_untouched(observation, usable):
+            return None
+        return usable
+
+    def _advance_hop(self, observation: ThreeBranchesObservation, heading: float, here, target_pos, sweep_at_target=False):
+        """Walk toward target_pos in short hops, sweeping at each waypoint before the next leg."""
+        if self.hop_point is None:
+            self.hop_point = self._pick_hop_point(observation, here, target_pos)
+            self._path = None
+            self.stuck_ticks = 0
+
+        # On the final leg the caller decides arrival (prop reach is tighter than 2.0), so don't
+        # sweep-stop short of the target -- that looped forever just outside use range.
+        final_leg = geometry.distance(self.hop_point, target_pos) < 1.0
+        if (sweep_at_target or not final_leg) and geometry.distance(here, self.hop_point) < 2.0:
+            self.hop_point = None
+            return action.stand(heading, "sweep")
+
+        if me.moved(observation) < 0.05:
+            self.stuck_ticks += 1
+        else:
+            self.stuck_ticks = 0
+        if self.stuck_ticks >= _STUCK_TICKS_LIMIT:
+            self.hop_point = None
+            self.stuck_ticks = 0
+            self._path = None
+            return action.stand(heading, "shrug")
+
+        return action.walk(self._walk_toward(self.hop_point, observation), 1.0, "none")
+
+    def _idle_hop(self, observation: ThreeBranchesObservation, heading: float, here):
+        """Keep moving in short hops when a role has run out of things to do for the day."""
+        if self.hop_point is None:
+            self.hop_point = self._random_nearby_point(observation, here)
+            self._path = None
+            self.stuck_ticks = 0
+            return action.stand(heading, self.rng.choice(_IDLE_EMOTES))
+        return self._advance_hop(observation, heading, here, self.hop_point, sweep_at_target=True)
+
+    def _advance_building(self, observation: ThreeBranchesObservation, heading: float, here):
+        """The building-wanderer role: head to a random building's doorway, sweep, pick another."""
+        if self.role_target is None:
             candidates = list(layout.buildings(observation))
             self.rng.shuffle(candidates)
+            doorway = None
             for building in candidates:
                 doorway = layout.doorway(observation, building["id"])
                 if doorway is not None:
-                    return doorway
-            return here
+                    break
+            if doorway is None:
+                return self._idle_hop(observation, heading, here)
+            self.role_target = {"prop_id": None, "type": None, "position": doorway}
+            self.hop_point = None
 
-        # "seek_tasks"
-        candidates = [
-            prop for prop in props.all(observation)
-            if prop["type"] in _TASK_TYPES and prop["id"] not in self.used_props
-        ]
-        if candidates:
-            cell = self.rng.choice(candidates)["cell"]
-            return _cell_centre(_nearest_walkable_cell(observation, cell))
-        return here
+        target_pos = self.role_target["position"]
+        if geometry.distance(here, target_pos) <= 2.0:
+            self.role_target = None
+            self.hop_point = None
+            return action.stand(heading, "sweep")
+
+        return self._advance_hop(observation, heading, here, target_pos)
 
     def _bell_destination(self, observation: ThreeBranchesObservation) -> dict[str, float] | None:
         """If the bell is ringing and within range, head there; otherwise None."""
@@ -308,11 +434,84 @@ class Agent:
 
         return None
 
+    def _task_tick(self, observation: ThreeBranchesObservation, heading: float, here) -> ThreeBranchesAction:
+        """One tick of role-driven work: answer the bell, grab a passing light, else do the job."""
+
+        # The bell outranks the day's role work, and is answered directly (no hops -- be quick)
+        bell_destination = self._bell_destination(observation)
+        if bell_destination is not None:
+            if self.current_destination != bell_destination:
+                self.current_destination = bell_destination
+                self._path = None
+                self.stuck_ticks = 0
+            if geometry.distance(here, self.current_destination) < 2.0:
+                self.current_destination = None
+                return action.stand(heading, "sweep")
+            return action.walk(self._walk_toward(self.current_destination, observation), 1.0, "none")
+
+        # Everyone, whatever their role, lights any unlit lantern/hearth they pass close enough to use
+        if self.active_task is None:
+            light = self._opportunistic_light(observation)
+            if light is not None:
+                self.active_task = {"prop_id": light["id"], "ticks_remaining": self._prop_use_ticks(light["type"])}
+                self.use_counter = 0
+            elif self.role_target is not None and self.role_target["prop_id"] is not None:
+                if geometry.distance(here, self.role_target["position"]) <= geometry.PROP_REACH:
+                    self.active_task = {
+                        "prop_id": self.role_target["prop_id"],
+                        "ticks_remaining": self._prop_use_ticks(self.role_target["type"]),
+                    }
+                    self.use_counter = 0
+
+        if self.active_task is not None:
+            if self.use_counter >= self.active_task["ticks_remaining"]:
+                self.used_props.add(self.active_task["prop_id"])
+                if self.role_target is not None and self.role_target["prop_id"] == self.active_task["prop_id"]:
+                    self.role_target = None
+                    self.hop_point = None
+                    # Start a break after completing a task
+                    self.break_ticks_remaining = self.rng.randint(_BREAK_MIN_TICKS, _BREAK_MAX_TICKS)
+                self.active_task = None
+                self.use_counter = 0
+            else:
+                self.use_counter += 1
+                return action.stand(heading, "use")
+
+        # Break after completing a task: idle-hop for a random duration (still lighting lamps en route)
+        if self.break_ticks_remaining > 0:
+            self.break_ticks_remaining -= 1
+            return self._idle_hop(observation, heading, here)
+
+        if self.role == "building_wanderer":
+            return self._advance_building(observation, heading, here)
+
+        if self.role_target is None:
+            prop = self._random_available_prop(observation, _ROLE_TARGET_TYPES[self.role])
+            if prop is None:
+                return self._idle_hop(observation, heading, here)  # nothing left today; keep it lively
+            self.role_target = {
+                "prop_id": prop["id"],
+                "type": prop["type"],
+                "position": _cell_centre(_nearest_walkable_cell(observation, prop["cell"])),
+            }
+            self.hop_point = None
+
+        if geometry.distance(here, self.role_target["position"]) <= geometry.PROP_REACH:
+            return action.stand(heading, "none")  # arrived; active_task starts from here next tick
+
+        return self._advance_hop(observation, heading, here, self.role_target["position"])
+
     def act(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction:
         """Choose one action from current observation and persistent day state."""
 
         here = me.position(observation)
         heading = me.heading(observation)
+
+        # Announce role once at start of day
+        if not self.announced_role:
+            self.announced_role = True
+            self._pending_chat = {"to": None, "text": f"I'm a {self.role.replace('_', ' ')}."}
+            return action.stand(heading, "none")
 
         reaction = self._react_to_people(observation)
         if reaction is not None:
@@ -322,92 +521,14 @@ class Agent:
             # Time to head home, whatever else was in progress
             self.phase = "returning"
             self.active_task = None
+            self.role_target = None
+            self.hop_point = None
             self.current_destination = None
             self._path = None
             self.stuck_ticks = 0
 
-        # Phase: plot (tend the home plot, then switch to wander)
-        if self.phase == "plot":
-            if self.active_task is None:
-                # Initialize plot task
-                self.active_task = {
-                    "prop_id": self.claimed_plot["id"],
-                    "ticks_remaining": self._prop_use_ticks(self.claimed_plot["type"]),
-                }
-                self.use_counter = 0
-
-            if self.use_counter >= self.active_task["ticks_remaining"]:
-                # Done tending plot
-                self.used_props.add(self.claimed_plot["id"])
-                self.phase = "wander"
-                self.active_task = None
-                self.use_counter = 0
-            else:
-                # Walk to plot or use it if close enough
-                plot_pos = _cell_centre(self.claimed_plot["cell"])
-                dist_to_plot = geometry.distance(here, plot_pos)
-
-                if dist_to_plot < 1.5:  # Close enough to use (prop_reach is 1.5)
-                    self.use_counter += 1
-                    return action.stand(heading, "use")
-                else:
-                    return action.walk(self._walk_toward(plot_pos, observation), 1.0, "none")
-
-        # Phase: wander (walk to a personality-driven destination, using anything usable
-        # spotted along the way, sweeping at the end of each leg, then picking a new one)
-        if self.phase == "wander":
-            if self.active_task is None:
-                usable = props.usable(observation)
-                if (
-                    usable is not None
-                    and usable["id"] not in self.used_props
-                    and _prop_untouched(observation, usable)
-                ):
-                    self.active_task = {
-                        "prop_id": usable["id"],
-                        "ticks_remaining": self._prop_use_ticks(usable["type"]),
-                    }
-                    self.use_counter = 0
-
-            if self.active_task is not None:
-                if self.use_counter >= self.active_task["ticks_remaining"]:
-                    self.used_props.add(self.active_task["prop_id"])
-                    self.active_task = None
-                    self.use_counter = 0
-                else:
-                    self.use_counter += 1
-                    return action.stand(heading, "use")
-
-            bell_destination = self._bell_destination(observation)
-            if bell_destination is not None and self.current_destination != bell_destination:
-                self.current_destination = bell_destination
-                self._path = None
-                self.stuck_ticks = 0
-
-            if self.current_destination is None:
-                # Deciding beat: pick where to head next and show it with a random emote
-                self.current_destination = self._pick_destination(observation)
-                self.stuck_ticks = 0
-                self._path = None  # force a fresh path for the new destination
-                return action.stand(heading, self.rng.choice(_IDLE_EMOTES))
-
-            if geometry.distance(here, self.current_destination) < 2.0:
-                # Arrived: sweep, then pick a fresh destination next tick
-                self.current_destination = None
-                return action.stand(heading, "sweep")
-
-            # Give up on a destination that isn't actually reachable instead of circling on it
-            if me.moved(observation) < 0.05:
-                self.stuck_ticks += 1
-            else:
-                self.stuck_ticks = 0
-            if self.stuck_ticks >= _STUCK_TICKS_LIMIT:
-                self.current_destination = None
-                self.stuck_ticks = 0
-                self._path = None
-                return action.stand(heading, "shrug")
-
-            return action.walk(self._walk_toward(self.current_destination, observation), 1.0, "none")
+        if self.phase == "task":
+            return self._task_tick(observation, heading, here)
 
         # Phase: returning (walk home for the night, then sleep for the rest of the day)
         if self.phase == "returning":
