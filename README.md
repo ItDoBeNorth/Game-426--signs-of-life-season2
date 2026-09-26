@@ -39,3 +39,13 @@ Test the connection with:
 ```console
 python -m sandbox llm
 ```
+
+## Design Goal
+Season 1: The goal of this season was to have the characters move around, perform tasks, and live a lively village life while interacting with the player. The characters now behave according to their roles, going around wandering randomly while also making their way to assigned tasks and greeting each other.
+
+## Reflection
+Season 2: I worked through and tested different roles of different amounts for the characters. I also tried to tie that a little more to pathfinding, where they wander but in an intentional direction to their next objective. I also had them check whether objects were occupied, and the logic for interactions with players was finalised. I tried to get them to cover most visible tasks. However, with the limited number of certain objects or certain players, it seemed that some players did the same task over and over. Still, the players seemed to interact with visible tasks more and group in an area where the player can see interactions more clearly.
+
+## AI Use Disclosure and Reflection
+I used Claude Code in VS Code. It coded all of this based on my pseudocode and instructions. I verified each set of code it wrote before approving it, reverted and asked for changes as needed, tested by watching and eval, and discussed my ideas for solutions before committing to one. I did not write any code directly, but read through it to check it. I had it set to ask for approval before committing anything, and that worked especially during testing and understanding what code was being changed. Planning mode helped a lot, but it's hard to keep it in check as to not add features without asking me. 
+
