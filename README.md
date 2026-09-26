@@ -41,7 +41,7 @@ python -m sandbox llm
 ```
 
 ## Design Goal
-Season 1: The goal of this season was to have the characters move around, perform tasks, and live a lively village life while interacting with the player. The characters now behave according to their roles, going around wandering randomly while also making their way to assigned tasks and greeting each other.
+Season 2: The goal of this season was to have the characters move around, perform tasks, and live a lively village life while interacting with the player. The characters now behave according to their roles, going around wandering randomly while also making their way to assigned tasks and greeting each other.
 
 ## Reflection
 Season 2: I worked through and tested different roles of different amounts for the characters. I also tried to tie that a little more to pathfinding, where they wander but in an intentional direction to their next objective. I also had them check whether objects were occupied, and the logic for interactions with players was finalised. I tried to get them to cover most visible tasks. However, with the limited number of certain objects or certain players, it seemed that some players did the same task over and over. Still, the players seemed to interact with visible tasks more and group in an area where the player can see interactions more clearly.
